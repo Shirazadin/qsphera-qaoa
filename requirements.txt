@@ -1,5 +1,5 @@
+qiskit>=1.2
+numpy
+scipy
 flask
 flask-cors
-numpy
-qiskit
-scipy
