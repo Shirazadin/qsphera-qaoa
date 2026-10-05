@@ -231,6 +231,20 @@ def health():
     return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "server": "qsphera_qaoa", "version": "3.0", "max_qubits": MAX_QUBITS})
 
 
+@app.route("/source", methods=["GET"])
+def source_endpoint():
+    """The code this server is running, for the app's Library."""
+    denied = check_key()
+    if denied:
+        return denied
+    path = os.path.abspath(__file__)
+    with open(path, encoding="utf-8") as f:
+        code = f.read()
+    import datetime
+    modified = datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc).isoformat()
+    return json_response({"file": "qiskit_qaoa_server.py", "code": code, "modified": modified})
+
+
 def read_qubo(data):
     Q = data.get("Q") or data.get("qubo_matrix") or []
     variables = data.get("variables") or data.get("controllable_buses") or data.get("pv_buses")
