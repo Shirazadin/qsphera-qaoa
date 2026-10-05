@@ -9,6 +9,7 @@ Endpoints:
   POST /qaoa        QAOA on a QUBO: {"Q": [[...]], "variables": [...], "p": 1, "shots": 2048}
   POST /pipeline    stage 3 only (QAOA), same body inside "prev_output"
   POST /classical   exact brute-force solution of the same QUBO (classical baseline)
+  GET  /source      the code this server is running (shown in the app Library)
 
 QAOA details:
   - QUBO x in {0,1}^n is mapped to an Ising Hamiltonian with x = (1 - z)/2:
