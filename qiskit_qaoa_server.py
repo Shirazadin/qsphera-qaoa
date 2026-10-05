@@ -15,7 +15,10 @@ QAOA details:
   - QUBO x in {0,1}^n is mapped to an Ising Hamiltonian with x = (1 - z)/2:
       J_ij = Q_ij / 2 (i < j),  h_i = -(Q_ii + sum_{j != i} Q_ij) / 2
   - Circuit: H on all qubits, then p layers of [RZZ(2*gamma*J_ij), RZ(2*gamma*h_i), RX(2*beta)].
-  - gamma, beta are tuned by COBYLA to minimize the expected QUBO energy.
+  - The QUBO is normalized (divided by its largest entry); the optimum is unchanged.
+  - Depth is at least 2 layers. gamma, beta are tuned by COBYLA from 4 starting
+    angle sets; the objective is CVaR 0.1 (mean energy of the best 10% of samples).
+    The best run is kept and measured with 4096 shots.
   - Qiskit bit order: qubit 0 is the rightmost character of a count key.
     Returned bitstrings are in VARIABLE order (character i = variable i).
 Reported quality metrics:
@@ -146,27 +149,60 @@ def qaoa_circuit(n, h, J, p):
     return qc
 
 
-def run_qaoa(Q, p=1, shots=2048, seed=42, maxiter=100):
+MIN_DEPTH = 2            # QAOA layers used at least (depth 1 is the weakest setting)
+RESTARTS = 4             # starting angle sets; the best optimized run is kept
+CVAR_ALPHA = 0.1         # optimize the mean of the best 10% of samples (CVaR)
+FINAL_SHOTS = 4096       # samples measured with the final angles
+
+
+def run_qaoa(Q, p=1, shots=2048, seed=42, maxiter=150):
+    """QAOA with a normalized QUBO, depth >= MIN_DEPTH, several starting angles
+    and a CVaR objective. Returns final counts, the best optimizer result, the
+    number of circuit evaluations and the settings used."""
     n = len(Q)
-    h, J = qubo_to_ising(Q)
-    qc = qaoa_circuit(n, h, J, p)
+    scale = float(np.max(np.abs(Q))) or 1.0
+    Qn = Q / scale                               # same optimum, angles on a common scale
+    h, J = qubo_to_ising(Qn)
+    depth = max(int(p), MIN_DEPTH)
+    qc = qaoa_circuit(n, h, J, depth)
     params = list(qc.parameters)                 # sorted by name: b[0..p-1], g[0..p-1]
     sampler = StatevectorSampler(seed=seed)
     evals = {"n": 0}
 
-    def counts_for(x):
+    def counts_for(x, nshots):
         bind = {params[i]: x[i] for i in range(len(params))}
-        return sampler.run([qc.assign_parameters(bind)], shots=shots).result()[0].data.meas.get_counts()
+        return sampler.run([qc.assign_parameters(bind)], shots=nshots).result()[0].data.meas.get_counts()
 
-    def expected(x):
+    def cvar(x):
         evals["n"] += 1
-        c = counts_for(x)
-        return sum(energy(Q, bits_from_key(k)) * v for k, v in c.items()) / shots
+        c = counts_for(x, shots)
+        vals = sorted((energy(Qn, bits_from_key(k)), v) for k, v in c.items())
+        keep = max(1, int(np.ceil(CVAR_ALPHA * shots)))
+        total, taken = 0.0, 0
+        for e, v in vals:
+            t = min(v, keep - taken)
+            total += e * t
+            taken += t
+            if taken >= keep:
+                break
+        return total / taken
 
-    x0 = np.full(len(params), 0.5)
-    res = minimize(expected, x0, method="COBYLA", options={"maxiter": maxiter})
-    counts = counts_for(res.x)
-    return counts, res, evals["n"]
+    # Starting angles: an annealing-like ramp (gamma rising, beta falling) at
+    # several overall sizes, so different runs start in different regions.
+    starts = []
+    for k, size in enumerate(np.linspace(0.3, 1.2, RESTARTS)):
+        ramp = (np.arange(depth) + 0.5) / depth
+        betas = size * 0.5 * (1 - ramp)
+        gammas = size * ramp
+        starts.append(np.concatenate([betas, gammas]))   # matches the b..., g... parameter order
+    best = None
+    for x0 in starts:
+        res = minimize(cvar, x0, method="COBYLA", options={"maxiter": maxiter})
+        if best is None or res.fun < best.fun:
+            best = res
+    counts = counts_for(best.x, FINAL_SHOTS)
+    settings = {"depth": depth, "restarts": RESTARTS, "objective": f"CVaR {CVAR_ALPHA}", "qubo_scale": scale, "final_shots": FINAL_SHOTS}
+    return counts, best, evals["n"], settings
 
 
 def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
@@ -177,13 +213,13 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
     variables = variables or [f"x{i}" for i in range(n)]
     exact = brute_force(Q) if n <= MAX_BRUTE_FORCE else None
 
-    result = {"n_qubits": n, "p_depth": int(p), "shots": int(shots), "variables": variables, "qiskit_available": QISKIT_AVAILABLE}
+    result = {"n_qubits": n, "p_depth": max(int(p), MIN_DEPTH), "shots": int(shots), "variables": variables, "qiskit_available": QISKIT_AVAILABLE}
     if not QISKIT_AVAILABLE:
         result.update({"method": "brute_force (Qiskit not installed)"})
     elif n > MAX_QUBITS:
         result.update({"method": "not run", "error": f"QAOA limited to {MAX_QUBITS} qubits on this server. Reduce the problem first."})
     else:
-        counts, res, n_evals = run_qaoa(Q, p=p, shots=shots, seed=seed)
+        counts, res, n_evals, settings = run_qaoa(Q, p=p, shots=shots, seed=seed)
         total = sum(counts.values())
         best_key = min(counts, key=lambda k: energy(Q, bits_from_key(k)))
         best_bits = bits_from_key(best_key)
@@ -197,7 +233,7 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
             "most_probable_bitstring": "".join(str(b) for b in bits_from_key(most_key)),
             "most_probable_share": counts[most_key] / total,
             "expected_energy": exp_e,
-            "optimizer": {"name": "COBYLA", "evaluations": n_evals, "angles": list(map(float, res.x))},
+            "optimizer": {"name": "COBYLA", "evaluations": n_evals, "angles": list(map(float, res.x)), **settings},
             "decisions": [{"variable": v, "value": int(b)} for v, b in zip(variables, best_bits)],
         })
         if exact:
@@ -229,7 +265,7 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "server": "qsphera_qaoa", "version": "3.0", "max_qubits": MAX_QUBITS})
+    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "server": "qsphera_qaoa", "version": "3.1", "max_qubits": MAX_QUBITS})
 
 
 @app.route("/source", methods=["GET"])
@@ -313,5 +349,5 @@ def classical_endpoint():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
-    print(f"QSphera QAOA server v3.0 on port {port}. Qiskit available: {QISKIT_AVAILABLE}")
+    print(f"QSphera QAOA server v3.1 on port {port}. Qiskit available: {QISKIT_AVAILABLE}")
     app.run(host="0.0.0.0", port=port, debug=False)
