@@ -1,12 +1,13 @@
 """
 QSphera QAOA Server (Qiskit)
 ============================
-Solves a QUBO sent by the app with QAOA on the Qiskit statevector sampler,
+Solves a QUBO sent by the app with QAOA on the Qiskit Aer statevector simulator
+(Qiskit Statevector if qiskit-aer is not installed),
 and with exact brute force for comparison.
 
 Endpoints:
   GET  /health      server status
-  POST /qaoa        QAOA on a QUBO: {"Q": [[...]], "variables": [...], "p": 1, "shots": 2048}
+  POST /qaoa        QAOA on a QUBO: {"Q": [[...]], "variables": [...], "p": 1}
   POST /pipeline    stage 3 only (QAOA), same body inside "prev_output"
   POST /classical   exact brute-force solution of the same QUBO (classical baseline)
   GET  /source      the code this server is running (shown in the app Library)
@@ -17,8 +18,11 @@ QAOA details:
   - Circuit: H on all qubits, then p layers of [RZZ(2*gamma*J_ij), RZ(2*gamma*h_i), RX(2*beta)].
   - The QUBO is normalized (divided by its largest entry); the optimum is unchanged.
   - Depth is at least 2 layers. gamma, beta are tuned by COBYLA from 4 starting
-    angle sets; the objective is CVaR 0.1 (mean energy of the best 10% of samples).
+    angle sets; the objective is CVaR 0.1 (mean energy of the lowest-energy 10%
+    of the probability), computed from the exact statevector probabilities.
     The best run is kept and measured with 4096 shots.
+  - All 2^n energies are computed once (vectorized) and used for the objective,
+    the exact optimum and the reported quality.
   - Qiskit bit order: qubit 0 is the rightmost character of a count key.
     Returned bitstrings are in VARIABLE order (character i = variable i).
 Reported quality metrics:
@@ -27,7 +31,7 @@ Reported quality metrics:
   - the same probability for uniform random sampling (1 / number of optimal states / 2^n).
 
 Run:
-  pip install -r requirements.txt      (qiskit, numpy, scipy, flask, flask-cors)
+  pip install -r requirements.txt      (qiskit, qiskit-aer, numpy, scipy, flask, flask-cors)
   python qiskit_qaoa_server.py         (listens on $PORT, default 8765)
 Optional: set QSPHERA_API_KEY; requests must then send header X-API-Key.
 """
@@ -43,11 +47,18 @@ from flask_cors import CORS
 try:
     from qiskit import QuantumCircuit
     from qiskit.circuit import ParameterVector
-    from qiskit.primitives import StatevectorSampler
+    from qiskit.quantum_info import Statevector
     from scipy.optimize import minimize
     QISKIT_AVAILABLE = True
 except Exception:  # pragma: no cover
     QISKIT_AVAILABLE = False
+
+try:  # Qiskit Aer: same statevector result, faster (C++). Used when installed.
+    from qiskit import transpile
+    from qiskit_aer import AerSimulator
+    AER = AerSimulator(method="statevector")
+except Exception:  # pragma: no cover
+    AER = None
 
 MAX_QUBITS = 22          # statevector memory and runtime limit for this server
 MAX_BRUTE_FORCE = 22
@@ -96,21 +107,36 @@ def energy(Q, bits):
     return float(x @ Q @ x)
 
 
-def brute_force(Q):
+def all_energies(Q):
+    """Energy of every bitstring, indexed like Qiskit: bit i of index k is variable i."""
+    n = len(Q)
+    k = np.arange(2 ** n, dtype=np.int64)
+    X = [((k >> i) & 1).astype(float) for i in range(n)]
+    E = np.zeros(2 ** n)
+    for i in range(n):
+        if Q[i][i] != 0:
+            E += Q[i][i] * X[i]
+        for j in range(i + 1, n):
+            if Q[i][j] != 0:
+                E += 2.0 * Q[i][j] * X[i] * X[j]
+    return E
+
+
+def index_bits(k, n):
+    return [(int(k) >> i) & 1 for i in range(n)]
+
+
+def brute_force(Q, E=None):
     n = len(Q)
     if n > MAX_BRUTE_FORCE:
         raise ValueError(f"Brute force limited to {MAX_BRUTE_FORCE} variables (got {n}).")
-    best_e, best = float("inf"), None
-    energies = {}
-    for bits in itertools.product([0, 1], repeat=n):
-        e = energy(Q, bits)
-        energies[bits] = e
-        if e < best_e - 1e-12:
-            best_e, best = e, list(bits)
-    optimal = [list(b) for b, e in energies.items() if abs(e - best_e) <= 1e-9]
-    worst_e = max(energies.values())
-    mean_e = float(np.mean(list(energies.values())))
-    return {"bits": best, "energy": best_e, "optimal_states": optimal, "worst_energy": worst_e, "random_mean_energy": mean_e}
+    if E is None:
+        E = all_energies(Q)
+    best_e = float(E.min())
+    opt_idx = np.flatnonzero(np.abs(E - best_e) <= 1e-9)
+    return {"bits": index_bits(opt_idx[0], n), "energy": best_e,
+            "optimal_states": [index_bits(k, n) for k in opt_idx],
+            "worst_energy": float(E.max()), "random_mean_energy": float(E.mean())}
 
 
 def qubo_to_ising(Q):
@@ -151,57 +177,66 @@ def qaoa_circuit(n, h, J, p):
 
 MIN_DEPTH = 2            # QAOA layers used at least (depth 1 is the weakest setting)
 RESTARTS = 4             # starting angle sets; the best optimized run is kept
-CVAR_ALPHA = 0.1         # optimize the mean of the best 10% of samples (CVaR)
+CVAR_ALPHA = 0.1         # optimize the mean of the best 10% of the probability (CVaR)
 FINAL_SHOTS = 4096       # samples measured with the final angles
 
 
-def run_qaoa(Q, p=1, shots=2048, seed=42, maxiter=150):
+def run_qaoa(Q, E, p=1, seed=42, maxiter=150):
     """QAOA with a normalized QUBO, depth >= MIN_DEPTH, several starting angles
-    and a CVaR objective. Returns final counts, the best optimizer result, the
-    number of circuit evaluations and the settings used."""
+    and a CVaR objective. The objective is computed from the exact Qiskit
+    statevector probabilities (no shot noise). Returns final counts, the best
+    optimizer result, the number of circuit evaluations and the settings used."""
     n = len(Q)
     scale = float(np.max(np.abs(Q))) or 1.0
-    Qn = Q / scale                               # same optimum, angles on a common scale
-    h, J = qubo_to_ising(Qn)
+    h, J = qubo_to_ising(Q / scale)              # same optimum, angles on a common scale
     depth = max(int(p), MIN_DEPTH)
     qc = qaoa_circuit(n, h, J, depth)
+    qc.remove_final_measurements()
     params = list(qc.parameters)                 # sorted by name: b[0..p-1], g[0..p-1]
-    sampler = StatevectorSampler(seed=seed)
+    if AER is not None:
+        qc_aer = qc.copy()
+        qc_aer.save_statevector()
+        qc_aer = transpile(qc_aer, AER)
+        params_aer = list(qc_aer.parameters)
+    order = np.argsort(E)                        # bitstrings from lowest to highest energy
+    E_sorted = E[order] / scale
     evals = {"n": 0}
 
-    def counts_for(x, nshots):
+    def probs_for(x):
+        if AER is not None:
+            bind = {params_aer[i]: x[i] for i in range(len(params_aer))}
+            sv = AER.run(qc_aer.assign_parameters(bind)).result().get_statevector()
+            return np.abs(np.asarray(sv)) ** 2
         bind = {params[i]: x[i] for i in range(len(params))}
-        return sampler.run([qc.assign_parameters(bind)], shots=nshots).result()[0].data.meas.get_counts()
+        return Statevector(qc.assign_parameters(bind)).probabilities()
 
     def cvar(x):
         evals["n"] += 1
-        c = counts_for(x, shots)
-        vals = sorted((energy(Qn, bits_from_key(k)), v) for k, v in c.items())
-        keep = max(1, int(np.ceil(CVAR_ALPHA * shots)))
-        total, taken = 0.0, 0
-        for e, v in vals:
-            t = min(v, keep - taken)
-            total += e * t
-            taken += t
-            if taken >= keep:
-                break
-        return total / taken
+        pr = probs_for(x)[order]
+        cum = np.cumsum(pr)
+        m = int(np.searchsorted(cum, CVAR_ALPHA)) + 1
+        w = pr[:m].copy()
+        w[-1] -= cum[m - 1] - CVAR_ALPHA if cum[m - 1] > CVAR_ALPHA else 0.0
+        return float(np.dot(w, E_sorted[:m]) / w.sum())
 
     # Starting angles: an annealing-like ramp (gamma rising, beta falling) at
     # several overall sizes, so different runs start in different regions.
     starts = []
-    for k, size in enumerate(np.linspace(0.3, 1.2, RESTARTS)):
+    for size in np.linspace(0.3, 1.2, RESTARTS):
         ramp = (np.arange(depth) + 0.5) / depth
-        betas = size * 0.5 * (1 - ramp)
-        gammas = size * ramp
-        starts.append(np.concatenate([betas, gammas]))   # matches the b..., g... parameter order
+        starts.append(np.concatenate([size * 0.5 * (1 - ramp), size * ramp]))   # b..., g... order
     best = None
     for x0 in starts:
         res = minimize(cvar, x0, method="COBYLA", options={"maxiter": maxiter})
         if best is None or res.fun < best.fun:
             best = res
-    counts = counts_for(best.x, FINAL_SHOTS)
-    settings = {"depth": depth, "restarts": RESTARTS, "objective": f"CVaR {CVAR_ALPHA}", "qubo_scale": scale, "final_shots": FINAL_SHOTS}
+    # Final measurement: FINAL_SHOTS samples from the best state.
+    pr = probs_for(best.x)
+    pr = pr / pr.sum()
+    rng = np.random.default_rng(seed)
+    idx, cnt = np.unique(rng.choice(len(pr), size=FINAL_SHOTS, p=pr), return_counts=True)
+    counts = {format(int(k), f"0{n}b"): int(c) for k, c in zip(idx, cnt)}   # Qiskit key format
+    settings = {"simulator": "Qiskit Aer statevector" if AER is not None else "Qiskit Statevector", "depth": depth, "restarts": RESTARTS, "objective": f"CVaR {CVAR_ALPHA}", "qubo_scale": scale, "final_shots": FINAL_SHOTS}
     return counts, best, evals["n"], settings
 
 
@@ -211,20 +246,21 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
     if n == 0:
         return {"error": "Empty QUBO."}
     variables = variables or [f"x{i}" for i in range(n)]
-    exact = brute_force(Q) if n <= MAX_BRUTE_FORCE else None
+    E = all_energies(Q)
+    exact = brute_force(Q, E) if n <= MAX_BRUTE_FORCE else None
 
-    result = {"n_qubits": n, "p_depth": max(int(p), MIN_DEPTH), "shots": int(shots), "variables": variables, "qiskit_available": QISKIT_AVAILABLE}
+    result = {"n_qubits": n, "p_depth": max(int(p), MIN_DEPTH), "shots": FINAL_SHOTS, "variables": variables, "qiskit_available": QISKIT_AVAILABLE}
     if not QISKIT_AVAILABLE:
         result.update({"method": "brute_force (Qiskit not installed)"})
     elif n > MAX_QUBITS:
         result.update({"method": "not run", "error": f"QAOA limited to {MAX_QUBITS} qubits on this server. Reduce the problem first."})
     else:
-        counts, res, n_evals, settings = run_qaoa(Q, p=p, shots=shots, seed=seed)
+        counts, res, n_evals, settings = run_qaoa(Q, E, p=p, seed=seed)
         total = sum(counts.values())
-        best_key = min(counts, key=lambda k: energy(Q, bits_from_key(k)))
+        best_key = min(counts, key=lambda k: E[int(k, 2)])
         best_bits = bits_from_key(best_key)
         most_key = max(counts, key=counts.get)
-        exp_e = sum(energy(Q, bits_from_key(k)) * v for k, v in counts.items()) / total
+        exp_e = sum(E[int(k, 2)] * v for k, v in counts.items()) / total
         result.update({
             "method": "QAOA",
             "bitstring": "".join(str(b) for b in best_bits),
@@ -265,7 +301,7 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "server": "qsphera_qaoa", "version": "3.1", "max_qubits": MAX_QUBITS})
+    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "aer_available": AER is not None, "server": "qsphera_qaoa", "version": "3.2", "max_qubits": MAX_QUBITS})
 
 
 @app.route("/source", methods=["GET"])
