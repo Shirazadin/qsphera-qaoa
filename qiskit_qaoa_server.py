@@ -39,6 +39,11 @@ Optional: set QSPHERA_API_KEY; requests must then send header X-API-Key.
 import json
 import os
 import itertools
+import time
+
+# One thread per simulation: hosted servers share a few CPUs, and extra threads
+# compete for them and slow the run down.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import numpy as np
 from flask import Flask, request, Response
@@ -56,7 +61,7 @@ except Exception:  # pragma: no cover
 try:  # Qiskit Aer: same statevector result, faster (C++). Used when installed.
     from qiskit import transpile
     from qiskit_aer import AerSimulator
-    AER = AerSimulator(method="statevector")
+    AER = AerSimulator(method="statevector", max_parallel_threads=1, max_parallel_experiments=1, max_parallel_shots=1)
 except Exception:  # pragma: no cover
     AER = None
 
@@ -241,6 +246,7 @@ def run_qaoa(Q, E, p=1, seed=42, maxiter=150):
 
 
 def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
+    t0 = time.time()
     Q = symmetric(Q_in)
     n = len(Q)
     if n == 0:
@@ -293,6 +299,7 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
         if result.get("method", "").startswith("brute_force"):
             result["bitstring"] = result["classical"]["bitstring"]
             result["energy"] = exact["energy"]
+    result["seconds"] = round(time.time() - t0, 2)
     return result
 
 
