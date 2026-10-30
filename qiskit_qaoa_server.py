@@ -7,7 +7,7 @@ and with exact brute force for comparison.
 
 Endpoints:
   GET  /health      server status
-  POST /qaoa        QAOA on a QUBO: {"Q": [[...]], "variables": [...], "p": 1}
+  POST /qaoa        QAOA on a QUBO: {"Q": [[...]], "variables": [...], "p": 1, "warm_start_bits": [...] (optional)}
   POST /pipeline    stage 3 only (QAOA), same body inside "prev_output"
   POST /classical   exact brute-force solution of the same QUBO (classical baseline)
   GET  /source      the code this server is running (shown in the app Library)
@@ -16,6 +16,11 @@ QAOA details:
   - QUBO x in {0,1}^n is mapped to an Ising Hamiltonian with x = (1 - z)/2:
       J_ij = Q_ij / 2 (i < j),  h_i = -(Q_ii + sum_{j != i} Q_ij) / 2
   - Circuit: H on all qubits, then p layers of [RZZ(2*gamma*J_ij), RZ(2*gamma*h_i), RX(2*beta)].
+  - Warm start (when "warm_start_bits" is sent, one bit per variable): warm-start QAOA
+    (Egger, Marecek, Woerner, Quantum 5, 479, 2021). Qubit i starts in RY(theta_i)|0>,
+    theta_i = 2*arcsin(sqrt(c_i)), c_i = 1 - WARM_EPS for bit 1 and WARM_EPS for bit 0;
+    the mixer on qubit i is RY(theta_i) RZ(-2*beta) RY(-theta_i) instead of RX(2*beta).
+    The result reports "warm_start": true.
   - The QUBO is normalized (divided by its largest entry); the optimum is unchanged.
   - Depth is at least 2 layers. gamma, beta are tuned by COBYLA from 4 starting
     angle sets; the objective is CVaR 0.1 (mean energy of the lowest-energy 10%
@@ -163,11 +168,16 @@ def bits_from_key(key):
     return [int(c) for c in reversed(key)]   # qubit 0 is the rightmost character
 
 
-def qaoa_circuit(n, h, J, p):
+def qaoa_circuit(n, h, J, p, thetas=None):
+    """thetas: warm-start angles per qubit (None = standard QAOA)."""
     g = ParameterVector("g", p)
     b = ParameterVector("b", p)
     qc = QuantumCircuit(n)
-    qc.h(range(n))
+    if thetas is None:
+        qc.h(range(n))
+    else:
+        for i in range(n):
+            qc.ry(thetas[i], i)
     for k in range(p):
         for (i, j), Jij in J.items():
             qc.rzz(2 * g[k] * Jij, i, j)
@@ -175,9 +185,22 @@ def qaoa_circuit(n, h, J, p):
             if h[i] != 0:
                 qc.rz(2 * g[k] * h[i], i)
         for i in range(n):
-            qc.rx(2 * b[k], i)
+            if thetas is None:
+                qc.rx(2 * b[k], i)
+            else:
+                qc.ry(-thetas[i], i)
+                qc.rz(-2 * b[k], i)
+                qc.ry(thetas[i], i)
     qc.measure_all()
     return qc
+
+
+WARM_EPS = 0.25          # warm start: probability kept on the opposite bit value (algorithm setting)
+
+
+def warm_thetas(bits):
+    c = [1 - WARM_EPS if int(x) == 1 else WARM_EPS for x in bits]
+    return [2 * float(np.arcsin(np.sqrt(ci))) for ci in c]
 
 
 MIN_DEPTH = 2            # QAOA layers used at least (depth 1 is the weakest setting)
@@ -186,7 +209,7 @@ CVAR_ALPHA = 0.1         # optimize the mean of the best 10% of the probability 
 FINAL_SHOTS = 4096       # samples measured with the final angles
 
 
-def run_qaoa(Q, E, p=1, seed=42, maxiter=150):
+def run_qaoa(Q, E, p=1, seed=42, maxiter=150, warm_bits=None):
     """QAOA with a normalized QUBO, depth >= MIN_DEPTH, several starting angles
     and a CVaR objective. The objective is computed from the exact Qiskit
     statevector probabilities (no shot noise). Returns final counts, the best
@@ -195,7 +218,8 @@ def run_qaoa(Q, E, p=1, seed=42, maxiter=150):
     scale = float(np.max(np.abs(Q))) or 1.0
     h, J = qubo_to_ising(Q / scale)              # same optimum, angles on a common scale
     depth = max(int(p), MIN_DEPTH)
-    qc = qaoa_circuit(n, h, J, depth)
+    thetas = warm_thetas(warm_bits) if warm_bits is not None else None
+    qc = qaoa_circuit(n, h, J, depth, thetas)
     qc.remove_final_measurements()
     params = list(qc.parameters)                 # sorted by name: b[0..p-1], g[0..p-1]
     if AER is not None:
@@ -241,17 +265,23 @@ def run_qaoa(Q, E, p=1, seed=42, maxiter=150):
     rng = np.random.default_rng(seed)
     idx, cnt = np.unique(rng.choice(len(pr), size=FINAL_SHOTS, p=pr), return_counts=True)
     counts = {format(int(k), f"0{n}b"): int(c) for k, c in zip(idx, cnt)}   # Qiskit key format
-    settings = {"simulator": "Qiskit Aer statevector" if AER is not None else "Qiskit Statevector", "depth": depth, "restarts": RESTARTS, "objective": f"CVaR {CVAR_ALPHA}", "qubo_scale": scale, "final_shots": FINAL_SHOTS}
+    settings = {"simulator": "Qiskit Aer statevector" if AER is not None else "Qiskit Statevector", "depth": depth, "restarts": RESTARTS, "objective": f"CVaR {CVAR_ALPHA}", "qubo_scale": scale, "final_shots": FINAL_SHOTS, "warm_start": thetas is not None}
+    if thetas is not None:
+        settings["warm_eps"] = WARM_EPS
     return counts, best, evals["n"], settings
 
 
-def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
+def solve(Q_in, variables=None, p=1, shots=2048, seed=42, warm_bits=None):
     t0 = time.time()
     Q = symmetric(Q_in)
     n = len(Q)
     if n == 0:
         return {"error": "Empty QUBO."}
     variables = variables or [f"x{i}" for i in range(n)]
+    if warm_bits is not None:
+        if len(warm_bits) != n or any(int(x) not in (0, 1) for x in warm_bits):
+            return {"error": f"warm_start_bits must have {n} values of 0 or 1 (got {len(warm_bits)})."}
+        warm_bits = [int(x) for x in warm_bits]
     E = all_energies(Q)
     exact = brute_force(Q, E) if n <= MAX_BRUTE_FORCE else None
 
@@ -261,14 +291,15 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
     elif n > MAX_QUBITS:
         result.update({"method": "not run", "error": f"QAOA limited to {MAX_QUBITS} qubits on this server. Reduce the problem first."})
     else:
-        counts, res, n_evals, settings = run_qaoa(Q, E, p=p, seed=seed)
+        counts, res, n_evals, settings = run_qaoa(Q, E, p=p, seed=seed, warm_bits=warm_bits)
         total = sum(counts.values())
         best_key = min(counts, key=lambda k: E[int(k, 2)])
         best_bits = bits_from_key(best_key)
         most_key = max(counts, key=counts.get)
         exp_e = sum(E[int(k, 2)] * v for k, v in counts.items()) / total
         result.update({
-            "method": "QAOA",
+            "method": "QAOA (warm start)" if warm_bits is not None else "QAOA",
+            "warm_start": warm_bits is not None,
             "bitstring": "".join(str(b) for b in best_bits),
             "bits": best_bits,
             "energy": energy(Q, best_bits),
@@ -308,7 +339,7 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42):
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "aer_available": AER is not None, "server": "qsphera_qaoa", "version": "3.2", "max_qubits": MAX_QUBITS})
+    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "aer_available": AER is not None, "server": "qsphera_qaoa", "version": "3.3", "max_qubits": MAX_QUBITS})
 
 
 @app.route("/source", methods=["GET"])
@@ -333,6 +364,11 @@ def read_qubo(data):
     return Q, variables
 
 
+def read_warm(data):
+    w = data.get("warm_start_bits")
+    return list(w) if isinstance(w, (list, tuple)) and len(w) else None
+
+
 @app.route("/qaoa", methods=["POST"])
 def qaoa_endpoint():
     denied = check_key()
@@ -343,7 +379,7 @@ def qaoa_endpoint():
         Q, variables = read_qubo(data)
         if not Q:
             return json_response({"error": "No QUBO matrix provided."}, status=400)
-        return json_response(solve(Q, variables, p=int(data.get("p", 1)), shots=int(data.get("shots", 2048)), seed=int(data.get("seed", 42))))
+        return json_response(solve(Q, variables, p=int(data.get("p", 1)), shots=int(data.get("shots", 2048)), seed=int(data.get("seed", 42)), warm_bits=read_warm(data)))
     except Exception as e:
         return json_response({"error": str(e)}, status=500)
 
@@ -358,10 +394,11 @@ def pipeline_endpoint():
         stage = str(data.get("stage", 3))
         if stage != "3":
             return json_response({"error": "Only stage 3 (QAOA) runs on this server. PCA, ANN and QUBO run in the Base44 backend."}, status=400)
-        Q, variables = read_qubo(data.get("prev_output", {}) or data)
+        src = data.get("prev_output", {}) or data
+        Q, variables = read_qubo(src)
         if not Q:
             return json_response({"error": "No QUBO matrix provided from stage 2."}, status=400)
-        out = solve(Q, variables, p=int(data.get("p", 1)), shots=int(data.get("shots", 2048)), seed=int(data.get("seed", 42)))
+        out = solve(Q, variables, p=int(data.get("p", 1)), shots=int(data.get("shots", 2048)), seed=int(data.get("seed", 42)), warm_bits=read_warm(data) or read_warm(src))
         out["stage"] = 3
         return json_response(out)
     except Exception as e:
@@ -392,5 +429,5 @@ def classical_endpoint():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
-    print(f"QSphera QAOA server v3.1 on port {port}. Qiskit available: {QISKIT_AVAILABLE}")
+    print(f"QSphera QAOA server v3.3 on port {port}. Qiskit available: {QISKIT_AVAILABLE}")
     app.run(host="0.0.0.0", port=port, debug=False)
