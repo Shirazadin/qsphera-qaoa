@@ -29,14 +29,6 @@ QAOA details:
     theta_i = 2*arcsin(sqrt(c_i)), c_i = 1 - WARM_EPS for bit 1 and WARM_EPS for bit 0;
     the mixer on qubit i is RY(theta_i) RZ(-2*beta) RY(-theta_i) instead of RX(2*beta).
     The result reports "warm_start": true.
-  - Presolve (before QAOA): a bit whose own term outweighs all its couplings has the
-    same value in every optimum, so it is fixed: x_i = 0 when Q_ii + (sum of its
-    negative couplings) > 0, x_i = 1 when Q_ii + (sum of its positive couplings) < 0
-    (couplings counted as Q_ij + Q_ji). Fixing repeats until no bit changes. QAOA runs
-    on the remaining bits, with the fixed bits' terms folded into their diagonal, so
-    small terms are not lost when a few large ones set the scale. The result reports
-    "presolve": fixed count, free count and the fixed values. If every bit is fixed,
-    QAOA is not run and the method says so.
   - The QUBO is normalized (divided by its largest entry); the optimum is unchanged.
   - Depth is at least 2 layers. gamma, beta are tuned by COBYLA from 4 starting
     angle sets; the objective is CVaR 0.1 (mean energy of the lowest-energy 10%
@@ -167,39 +159,6 @@ def brute_force(Q, E=None):
     return {"bits": index_bits(opt_idx[0], n), "energy": best_e,
             "optimal_states": [index_bits(k, n) for k in opt_idx],
             "worst_energy": float(E.max()), "random_mean_energy": float(E.mean())}
-
-
-def presolve(Q):
-    """Fix bits whose value is the same in every optimum (dominance rule).
-    Q is symmetric. Returns {index: value} for the fixed bits."""
-    n = len(Q)
-    fixed = {}
-    changed = True
-    while changed:
-        changed = False
-        for i in range(n):
-            if i in fixed:
-                continue
-            lin = Q[i][i] + sum(2 * Q[i][j] for j in fixed if fixed[j] == 1)
-            free = [2 * Q[i][j] for j in range(n) if j != i and j not in fixed]
-            neg = sum(c for c in free if c < 0)
-            pos = sum(c for c in free if c > 0)
-            if lin + neg > 1e-12:
-                fixed[i] = 0
-                changed = True
-            elif lin + pos < -1e-12:
-                fixed[i] = 1
-                changed = True
-    return fixed
-
-
-def reduced_qubo(Q, fixed):
-    """QUBO over the free bits, with the fixed bits' couplings folded into the diagonal."""
-    free = [i for i in range(len(Q)) if i not in fixed]
-    R = np.array([[Q[a][b] for b in free] for a in free], dtype=float)
-    for k, i in enumerate(free):
-        R[k][k] += sum(2 * Q[i][j] for j in fixed if fixed[j] == 1)
-    return R, free
 
 
 def qubo_to_ising(Q):
@@ -344,36 +303,14 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42, warm_bits=None):
     elif n > MAX_QUBITS:
         result.update({"method": "not run", "error": f"QAOA limited to {MAX_QUBITS} qubits on this server. Reduce the problem first."})
     else:
-        fixed = presolve(Q)
-        R, free = reduced_qubo(Q, fixed)
-
-        def full_key(reduced_bits):
-            bits = [fixed.get(i, 0) for i in range(n)]
-            for k, i in enumerate(free):
-                bits[i] = int(reduced_bits[k])
-            return "".join(str(b) for b in reversed(bits))   # Qiskit key format
-
-        if free:
-            ER = all_energies(R)
-            wR = [warm_bits[i] for i in free] if warm_bits is not None else None
-            rcounts, res, n_evals, settings = run_qaoa(R, ER, p=p, seed=seed, warm_bits=wR)
-            counts = {}
-            for k, c in rcounts.items():
-                fk = full_key(bits_from_key(k))
-                counts[fk] = counts.get(fk, 0) + c
-        else:
-            counts = {full_key([]): FINAL_SHOTS}
-            res, n_evals, settings = None, 0, {"note": "all bits fixed by presolve; QAOA not run"}
-        result["presolve"] = {"fixed_count": len(fixed), "free_count": len(free), "qaoa_qubits": len(free),
-                              "fixed": {variables[i]: v for i, v in sorted(fixed.items())}}
+        counts, res, n_evals, settings = run_qaoa(Q, E, p=p, seed=seed, warm_bits=warm_bits)
         total = sum(counts.values())
         best_key = min(counts, key=lambda k: E[int(k, 2)])
         best_bits = bits_from_key(best_key)
         most_key = max(counts, key=counts.get)
         exp_e = sum(E[int(k, 2)] * v for k, v in counts.items()) / total
         result.update({
-            "method": ("presolve (all bits fixed, QAOA not needed)" if not free
-                       else "QAOA (warm start)" if warm_bits is not None else "QAOA"),
+            "method": "QAOA (warm start)" if warm_bits is not None else "QAOA",
             "warm_start": warm_bits is not None,
             "bitstring": "".join(str(b) for b in best_bits),
             "bits": best_bits,
@@ -381,7 +318,7 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42, warm_bits=None):
             "most_probable_bitstring": "".join(str(b) for b in bits_from_key(most_key)),
             "most_probable_share": counts[most_key] / total,
             "expected_energy": exp_e,
-            "optimizer": {"name": "COBYLA", "evaluations": n_evals, "angles": list(map(float, res.x)) if res is not None else [], **settings},
+            "optimizer": {"name": "COBYLA", "evaluations": n_evals, "angles": list(map(float, res.x)), **settings},
             "decisions": [{"variable": v, "value": int(b)} for v, b in zip(variables, best_bits)],
         })
         if exact:
@@ -414,7 +351,7 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42, warm_bits=None):
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "aer_available": AER is not None, "server": "qsphera_qaoa", "version": "3.5", "max_qubits": MAX_QUBITS, "async_jobs": True})
+    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "aer_available": AER is not None, "server": "qsphera_qaoa", "version": "3.4", "max_qubits": MAX_QUBITS, "async_jobs": True})
 
 
 @app.route("/source", methods=["GET"])
@@ -586,5 +523,5 @@ def jobs_status(job_id):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
-    print(f"QSphera QAOA server v3.5 on port {port}. Qiskit available: {QISKIT_AVAILABLE}")
+    print(f"QSphera QAOA server v3.4 on port {port}. Qiskit available: {QISKIT_AVAILABLE}")
     app.run(host="0.0.0.0", port=port, debug=False)
