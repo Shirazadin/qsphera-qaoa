@@ -10,6 +10,14 @@ Endpoints:
   POST /qaoa        QAOA on a QUBO: {"Q": [[...]], "variables": [...], "p": 1, "warm_start_bits": [...] (optional)}
   POST /pipeline    stage 3 only (QAOA), same body inside "prev_output"
   POST /classical   exact brute-force solution of the same QUBO (classical baseline)
+  POST /jobs        start QAOA as a background job (same body as /qaoa); returns
+                    {"job_id", "status"} at once. Header Idempotency-Key: the same key
+                    returns the same job instead of starting a second one.
+  GET  /jobs/<id>   job status: queued, running, completed (with "result", the same
+                    object /qaoa returns) or failed (with "result": {"error"}).
+                    Jobs are stored as files in QSPHERA_JOBS_DIR (default /tmp/qsphera_jobs),
+                    so every server worker on the instance sees them. A restart of the
+                    instance loses running jobs; their status then reads 404 "Job not found".
   GET  /source      the code this server is running (shown in the app Library)
 
 QAOA details:
@@ -45,6 +53,10 @@ import json
 import os
 import itertools
 import time
+import hashlib
+import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # One thread per simulation: hosted servers share a few CPUs, and extra threads
 # compete for them and slow the run down.
@@ -339,7 +351,7 @@ def solve(Q_in, variables=None, p=1, shots=2048, seed=42, warm_bits=None):
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "aer_available": AER is not None, "server": "qsphera_qaoa", "version": "3.3", "max_qubits": MAX_QUBITS})
+    return json_response({"status": "ok", "qiskit_available": QISKIT_AVAILABLE, "aer_available": AER is not None, "server": "qsphera_qaoa", "version": "3.4", "max_qubits": MAX_QUBITS, "async_jobs": True})
 
 
 @app.route("/source", methods=["GET"])
@@ -427,7 +439,89 @@ def classical_endpoint():
         return json_response({"error": str(e)}, status=500)
 
 
+# ---------------------------------------------------------------------------
+# Background jobs (no request time limit on the computation)
+# ---------------------------------------------------------------------------
+JOBS_DIR = os.environ.get("QSPHERA_JOBS_DIR", "/tmp/qsphera_jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
+JOB_WORKERS = 1          # QAOA runs at a time per server process; others wait as "queued"
+EXECUTOR = ThreadPoolExecutor(max_workers=JOB_WORKERS)
+JOB_LOCK = threading.Lock()
+
+
+def job_path(job_id):
+    return os.path.join(JOBS_DIR, f"{job_id}.json")
+
+
+def write_job(job):
+    tmp = job_path(job["job_id"]) + f".{uuid.uuid4().hex}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(to_native(job), f)
+    os.replace(tmp, job_path(job["job_id"]))
+
+
+def read_job(job_id):
+    try:
+        with open(job_path(job_id), encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def run_job(job_id, Q, variables, p, shots, seed, warm_bits):
+    job = read_job(job_id) or {"job_id": job_id}
+    job.update({"status": "running", "started": time.time()})
+    write_job(job)
+    try:
+        result = solve(Q, variables, p=p, shots=shots, seed=seed, warm_bits=warm_bits)
+        status = "failed" if result.get("error") else "completed"
+    except Exception as e:  # the job reports the error; nothing is returned as a result
+        result, status = {"error": str(e)}, "failed"
+    job.update({"status": status, "finished": time.time(), "result": result})
+    write_job(job)
+
+
+@app.route("/jobs", methods=["POST"])
+def jobs_submit():
+    denied = check_key()
+    if denied:
+        return denied
+    try:
+        data = request.get_json(force=True) or {}
+        Q, variables = read_qubo(data)
+        if not Q:
+            return json_response({"error": "No QUBO matrix provided."}, status=400)
+        key = request.headers.get("Idempotency-Key") or uuid.uuid4().hex
+        job_id = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        with JOB_LOCK:
+            try:   # create the job file only if it does not exist (same key = same job)
+                fd = os.open(job_path(job_id), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                job = read_job(job_id) or {"job_id": job_id, "status": "queued"}
+                return json_response({"job_id": job_id, "status": job.get("status"), "result": job.get("result")})
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"job_id": job_id, "status": "queued", "created": time.time()}, f)
+        EXECUTOR.submit(run_job, job_id, Q, variables, int(data.get("p", 1)), int(data.get("shots", 2048)),
+                        int(data.get("seed", 42)), read_warm(data))
+        return json_response({"job_id": job_id, "status": "queued"}, status=202)
+    except Exception as e:
+        return json_response({"error": str(e)}, status=500)
+
+
+@app.route("/jobs/<job_id>", methods=["GET"])
+def jobs_status(job_id):
+    denied = check_key()
+    if denied:
+        return denied
+    if not all(c in "0123456789abcdef" for c in job_id) or len(job_id) != 64:
+        return json_response({"error": "Invalid job identifier."}, status=400)
+    job = read_job(job_id)
+    if job is None:
+        return json_response({"error": "Job not found. The server may have restarted; run the QAOA step again."}, status=404)
+    return json_response({"job_id": job_id, "status": job.get("status"), "result": job.get("result")})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
-    print(f"QSphera QAOA server v3.3 on port {port}. Qiskit available: {QISKIT_AVAILABLE}")
+    print(f"QSphera QAOA server v3.4 on port {port}. Qiskit available: {QISKIT_AVAILABLE}")
     app.run(host="0.0.0.0", port=port, debug=False)
